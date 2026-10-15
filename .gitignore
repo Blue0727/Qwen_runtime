@@ -1,0 +1,45 @@
+# Local model downloads and weights
+/models/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+
+# CMake, MSVC and local editor files
+/build/
+/build-*/
+/build_*/
+/cmake-build-*/
+/out/
+/.vs/
+/.vscode/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Python environments and caches
+/.venv/
+/venv/
+/env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local credentials and tool settings
+.env
+.env.*
+!.env.example
+/.codex/
+/.agents/
+
+# Generated text and token IDs; keep the small prompt fixtures
+/data/generated*.json
+/data/generated*.txt
+
+# Operating system files
+.DS_Store
+Thumbs.db
