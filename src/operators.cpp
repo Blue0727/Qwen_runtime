@@ -3,6 +3,62 @@
 #include <stdexcept>
 #include <cassert>
 
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+namespace
+{
+
+/**
+ * @brief 计算两个连续 FP32 数组的点积。
+ * @pre 两个数组均至少包含 count 个有效元素。
+ *
+ * 向量路径分八个通道分别累加：
+ * acc[k] = a[k] * b[k] + a[k+8] * b[k+8] + ...
+ * 最后合并八个通道，并处理不足八项的尾部。
+ */
+float dot_product_f32(const float* a, const float* b, int count)
+{
+    float sum = 0.0f;
+    int i = 0;
+
+#if defined(__AVX2__)
+    // 一个 256 位向量容纳八个 32 位浮点数。
+    __m256 acc = _mm256_setzero_ps();
+
+    for (; i + 8 <= count; i += 8)
+    {
+        // loadu 不要求数组地址按 32 字节对齐。
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+
+        const __m256 products = _mm256_mul_ps(va, vb);
+        acc = _mm256_add_ps(acc, products);
+    }
+
+    // acc 中仍是八个独立的部分和，需要合并为一个标量。
+    float lanes[8];
+    _mm256_storeu_ps(lanes, acc);
+
+    for (int lane = 0; lane < 8; ++lane)
+    {
+        sum += lanes[lane];
+    }
+#endif
+
+    // 向量路径处理尾部；未启用向量路径时处理整个数组。
+    for (; i < count; ++i)
+    {
+        sum += a[i] * b[i];
+    }
+
+    return sum;
+}
+
+} // namespace
+
 /**
  * @brief 单 token 的 FP32 线性投影。
  * @param weight 行优先矩阵 [out_features,in_features]。
@@ -29,20 +85,22 @@ void linear(
     // W[row,col] 的展开索引为 row * in_features + col。
     // 每行重新从零累加，对应 y[row] = sum_col(W[row,col] * x[col]) + bias[row]。
     #pragma omp parallel for schedule(static)
-    for (int row = 0; row < out_features; row++)
+    for (int row = 0; row < out_features; ++row)
     {
-        float sum = 0.0f;
-        for (int col = 0; col < in_features; col++)
-        {
-            float w = weight.data[row * in_features + col];
-            float x = input[col];
-            sum += w * x;
-        }
+        // 行优先矩阵中，第 row 行包含连续的 in_features 个元素。
+        const float* row_data =
+            weight.data.data() +
+            static_cast<std::size_t>(row) * in_features;
+
+        // 每个线程独立计算自己负责的输出行。
+        float sum = dot_product_f32(
+            row_data, input.data(), in_features);
 
         if (bias != nullptr)
         {
             sum += bias->data[row];
         }
+
         output[row] = sum;
     }
 }
