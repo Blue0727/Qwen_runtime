@@ -12,6 +12,20 @@ void linear(
     std::vector<float>& output,
     const TensorF32* bias = nullptr);
 
+// Q4 权重、FP32 输入输出；输出由调用方预分配。
+void linear_q4(
+    const TensorQ4& weight,
+    const std::vector<float>& input,
+    std::vector<float>& output,
+    const TensorF32* bias = nullptr);
+
+// 根据权重类型选择 FP32 或 Q4 线性投影。
+void linear(
+    const LinearWeight& weight,
+    const std::vector<float>& input,
+    std::vector<float>& output,
+    const TensorF32* bias = nullptr);
+
 // 对单个隐藏向量做 RMSNorm，输出由调用方预分配。
 void rmsnorm(
     const TensorF32& weight,
@@ -68,10 +82,5 @@ ErrorStats compute_error_stats(
     const std::vector<float>& reference,
     const std::vector<float>& actual);
 
-// Q4 权重、FP32 输入输出；输出由调用方预分配。
-void linear_q4(
-    const TensorQ4& weight,
-    const std::vector<float>& input,
-    std::vector<float>& output,
-    const TensorF32* bias = nullptr);
+
 #endif // OPERATORS_H

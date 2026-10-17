@@ -6,6 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <utility>
 
 /**
  * @brief 按模型要求校验形状，并加载为拥有内存的 FP32 张量。
@@ -28,124 +29,147 @@ static TensorF32 load_checked_tensor(
 }
 
 /**
- * @brief 加载一个 Transformer 层的 12 项权重，包含 Q/K/V bias。
- * @pre config 已验证，layer_index 在 [0, config.num_layers) 内，
- *      header 与 model_path 对应同一个未被修改的文件。
+ * @brief 加载一个投影矩阵，并转换为指定的存储表示。
+ *
+ * 每次只处理一个矩阵：
+ * FP32 模式移动数据到 variant，避免复制；
+ * Q4 模式返回量化结果，函数退出时释放临时 FP32 数据。
+ *
+ * 形状、文件类型和数据范围检查复用现有加载与量化入口。
+ */
+static LinearWeight load_linear_weight(
+    const std::filesystem::path& model_path,
+    const SafeTensorsHeader& header,
+    const std::string& tensor_name,
+    const std::vector<std::int64_t>& expected_shape,
+    WeightFormat weight_format)
+{
+    TensorF32 fp32 = load_checked_tensor(
+        model_path, header, tensor_name, expected_shape);
+
+    if (weight_format == WeightFormat::Q4)
+    {
+        return LinearWeight{quantize_q4_matrix(fp32)};
+    }
+
+    return LinearWeight{std::move(fp32)};
+}
+
+/**
+ * @brief 加载一层权重，按指定格式保存七个投影矩阵。
+ * @pre config 已验证，layer_index 有效，header 与文件对应。
+ *
+ * Norm 和 Q/K/V bias 保持 FP32。
+ * 投影矩阵逐个加载并转换，避免保留整层 FP32 临时副本。
  */
 LayerWeights load_layer_weights(
     const std::filesystem::path& model_path,
     const SafeTensorsHeader& header,
     const ModelConfig& config,
-    int layer_index)
+    int layer_index,
+    WeightFormat weight_format)
 {
     LayerWeights layer;
 
-    // H：隐藏维度；K：全部 KV 头的拼接维度；I：FFN 中间维度。
-    int H = config.hidden_size;
-    int K = config.kv_dim();
-    int I = config.intermediate_size;
+    const int H = config.hidden_size;
+    const int K = config.kv_dim();
+    const int I = config.intermediate_size;
 
-    std::string prefix =
+    const std::string prefix =
         "model.layers." + std::to_string(layer_index) + ".";
 
-    // Attention 前的 RMSNorm 缩放权重：[H]。
     layer.attn_norm = load_checked_tensor(
         model_path, header,
-        prefix + "input_layernorm.weight",
-        {H});
+        prefix + "input_layernorm.weight", {H});
 
-    // Q 投影：矩阵 [H,H]、偏置 [H]。
-    // K/V 投影：矩阵 [K,H]、偏置 [K]，保留 GQA 的较小 KV 维度。
-    layer.Wq = load_checked_tensor(
+    // Q：[H,H]；K/V：[K,H]，三个偏置保持 FP32。
+    layer.Wq = load_linear_weight(
         model_path, header,
-        prefix + "self_attn.q_proj.weight",
-        {H, H});
+        prefix + "self_attn.q_proj.weight", {H, H}, weight_format);
     layer.bq = load_checked_tensor(
         model_path, header,
-        prefix + "self_attn.q_proj.bias",
-        {H});
-    layer.Wk = load_checked_tensor(
+        prefix + "self_attn.q_proj.bias", {H});
+
+    layer.Wk = load_linear_weight(
         model_path, header,
-        prefix + "self_attn.k_proj.weight",
-        {K, H});
+        prefix + "self_attn.k_proj.weight", {K, H}, weight_format);
     layer.bk = load_checked_tensor(
         model_path, header,
-        prefix + "self_attn.k_proj.bias",
-        {K});
-    layer.Wv = load_checked_tensor(
+        prefix + "self_attn.k_proj.bias", {K});
+
+    layer.Wv = load_linear_weight(
         model_path, header,
-        prefix + "self_attn.v_proj.weight",
-        {K, H});
+        prefix + "self_attn.v_proj.weight", {K, H}, weight_format);
     layer.bv = load_checked_tensor(
         model_path, header,
-        prefix + "self_attn.v_proj.bias",
-        {K});
+        prefix + "self_attn.v_proj.bias", {K});
 
-    // Attention 输出投影：[H,H]，无 bias。
-    layer.Wo = load_checked_tensor(
+    layer.Wo = load_linear_weight(
         model_path, header,
-        prefix + "self_attn.o_proj.weight",
-        {H, H});
+        prefix + "self_attn.o_proj.weight", {H, H}, weight_format);
 
-    // FFN 前的 RMSNorm 缩放权重：[H]。
     layer.ffn_norm = load_checked_tensor(
         model_path, header,
-        prefix + "post_attention_layernorm.weight",
-        {H});
+        prefix + "post_attention_layernorm.weight", {H});
 
-    // SwiGLU 的 gate/up 为 [I,H]，down 为 [H,I]，三个投影均无 bias。
-    layer.W_gate = load_checked_tensor(
+    // FFN：gate/up 为 [I,H]，down 为 [H,I]。
+    layer.W_gate = load_linear_weight(
         model_path, header,
-        prefix + "mlp.gate_proj.weight",
-        {I, H});
-    layer.W_up = load_checked_tensor(
+        prefix + "mlp.gate_proj.weight", {I, H}, weight_format);
+    layer.W_up = load_linear_weight(
         model_path, header,
-        prefix + "mlp.up_proj.weight",
-        {I, H});
-    layer.W_down = load_checked_tensor(
+        prefix + "mlp.up_proj.weight", {I, H}, weight_format);
+    layer.W_down = load_linear_weight(
         model_path, header,
-        prefix + "mlp.down_proj.weight",
-        {H, I});
+        prefix + "mlp.down_proj.weight", {H, I}, weight_format);
+
     return layer;
 }
 
 /**
- * @brief 从模型目录读取配置和全部 BF16 权重，转换为 FP32。
- * @return 持有配置、embedding、各层权重和最终 RMSNorm 权重的模型。
- * @note 输出投影与 embedding 共享 model.weights.embed_tokens。
+ * @brief 加载模型，按指定格式保存层内投影矩阵。
+ *
+ * Embedding、共享输出投影及所有 Norm / bias 保持 FP32。
+ * Q4 转换仅发生在加载阶段，不进入 token forward。
  */
-Model load_model(const std::filesystem::path& model_dir)
+Model load_model(
+    const std::filesystem::path& model_dir,
+    WeightFormat weight_format)
 {
     Model model;
-    // 使用 filesystem::path 拼接，保留 Windows 中文目录的路径表示。
-    auto config_path = model_dir / "config.json";
-    auto model_path = model_dir / "model.safetensors";
 
-    // 配置在加载时验证；文件头读取一次，供所有权重加载复用。
+    const auto config_path = model_dir / "config.json";
+    const auto model_path = model_dir / "model.safetensors";
+
     model.config = load_model_config(config_path);
-    SafeTensorsHeader header = read_safetensors_header(model_path);
+    const SafeTensorsHeader header =
+        read_safetensors_header(model_path);
 
-    int H = model.config.hidden_size;
-    int vocab = model.config.vocab_size;
-    // 全局 embedding：[vocab,H]；同一张量也用于最终词表投影。
+    const int H = model.config.hidden_size;
+    const int vocab = model.config.vocab_size;
+
+    // 同一份 FP32 embedding 同时用于最终词表投影。
     model.weights.embed_tokens = load_checked_tensor(
         model_path, header,
-        "model.embed_tokens.weight",
-        {vocab, H});
-    // 全部 Transformer 层之后使用的最终 RMSNorm 缩放权重：[H]。
+        "model.embed_tokens.weight", {vocab, H});
+
     model.weights.final_norm = load_checked_tensor(
         model_path, header,
-        "model.norm.weight",
-        {H});
+        "model.norm.weight", {H});
 
-    // reserve 预留层对象容量；push_back 将返回的临时层权重移动进数组。
     model.weights.layers.reserve(model.config.num_layers);
-    for (int i = 0; i < model.config.num_layers; i++)
+
+    for (int i = 0; i < model.config.num_layers; ++i)
     {
         model.weights.layers.push_back(
-            load_layer_weights(model_path, header, model.config, i));
+            load_layer_weights(
+                model_path,
+                header,
+                model.config,
+                i,
+                weight_format));
     }
-    // 直接返回局部对象，支持返回值优化或隐式移动。
+
     return model;
 }
 

@@ -100,6 +100,23 @@ int main(int argc, char* argv[])
             throw std::invalid_argument("Thread count must be positive");
         }
 
+        // 第二个参数选择层内投影权重格式，省略时使用 FP32。
+        const std::string weight_mode =
+            argc > 2 ? argv[2] : "fp32";
+
+        if (weight_mode != "fp32" && weight_mode != "q4")
+        {
+            throw std::invalid_argument(
+                "Weight mode must be fp32 or q4");
+        }
+
+        const WeightFormat weight_format =
+            weight_mode == "q4"
+                ? WeightFormat::Q4
+                : WeightFormat::FP32;
+
+        std::cout << "Layer Linear weights: "
+                << weight_mode << '\n';
         // 关闭动态线程数调整，并设置后续并行区域的请求线程数。
         omp_set_dynamic(0);
         omp_set_num_threads(thread_count);
@@ -115,7 +132,7 @@ int main(int argc, char* argv[])
         const auto input_path =
             project_root / "data" / "prompt_ids.json";
         const auto output_path =
-            project_root / "data" / "generated_ids.json";
+        project_root / "data" / ("generated_ids_" + weight_mode + ".json");
 
         std::ifstream input(input_path);
         if (!input.is_open())
@@ -128,7 +145,7 @@ int main(int argc, char* argv[])
         input.close();
 
         std::cout << "Loading model...\n" << std::flush;
-        Model model = load_model(model_dir);
+        Model model = load_model(model_dir, weight_format);
 
         KVCache cache;
         cache.init(model.config, 512);
@@ -191,7 +208,8 @@ int main(int argc, char* argv[])
         }
 
         std::cout << "Generated tokens: " << generated.size() << '\n';
-        std::cout << "Saved data/generated_ids.json\n";
+        std::cout << "Saved data/"
+          << output_path.filename().string() << '\n';
         return 0;
     }
     catch (const std::exception& e)

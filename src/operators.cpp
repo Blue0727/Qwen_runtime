@@ -189,6 +189,35 @@ void linear_q4(
 }
 
 /**
+ * @brief 根据投影权重的存储类型选择对应计算内核。
+ * @pre weight 持有有效矩阵，输入输出满足底层算子的要求。
+ *
+ * 类型分派在每次矩阵调用时执行一次，不进入逐行或逐块循环。
+ * 通过 const 指针或引用访问实际权重，不复制或反量化矩阵。
+ */
+void linear(
+    const LinearWeight& weight,
+    const std::vector<float>& input,
+    std::vector<float>& output,
+    const TensorF32* bias)
+{
+    // 持有 FP32 时返回其地址，否则返回 nullptr。
+    if (const TensorF32* fp32 =
+            std::get_if<TensorF32>(&weight))
+    {
+        linear(*fp32, input, output, bias);
+        return;
+    }
+
+    // 当前另一种权重类型为 Q4，get 返回 const 引用。
+    linear_q4(
+        std::get<TensorQ4>(weight),
+        input,
+        output,
+        bias);
+}
+
+/**
  * @brief 按均方根缩放单个隐藏向量，再乘学习得到的逐维权重。
  * @param weight 已加载、形状为 [H] 的缩放权重。
  * @param input 长度为 H 的输入。

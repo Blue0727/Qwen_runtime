@@ -11,21 +11,27 @@
 #include <string>
 #include <vector>
 
-// 单层 FP32 权重。H=hidden_size，K=kv_dim，I=intermediate_size。
+// Transformer 层内线性投影的权重格式。
+enum class WeightFormat
+{
+    FP32,
+    Q4
+};
+// 单层权重。H=hidden_size，K=kv_dim，I=intermediate_size。
 struct LayerWeights
 {
-    TensorF32 attn_norm; ///< Attention 前的 RMSNorm 缩放权重：[H]。
-    TensorF32 Wq;        ///< Query 投影：[H,H]。
+    TensorF32 attn_norm;  ///< Attention RMSNorm：[H]。
+    LinearWeight Wq;     ///< Query 投影：[H,H]。
     TensorF32 bq;        ///< Query 偏置：[H]。
-    TensorF32 Wk;        ///< Key 投影：[K,H]。
+    LinearWeight Wk;     ///< Key 投影：[K,H]。
     TensorF32 bk;        ///< Key 偏置：[K]。
-    TensorF32 Wv;        ///< Value 投影：[K,H]。
+    LinearWeight Wv;     ///< Value 投影：[K,H]。
     TensorF32 bv;        ///< Value 偏置：[K]。
-    TensorF32 Wo;        ///< Attention 输出投影：[H,H]，无偏置。
-    TensorF32 ffn_norm;  ///< FFN 前的 RMSNorm 缩放权重：[H]。
-    TensorF32 W_gate;    ///< SwiGLU gate 支路：[I,H]，无偏置。
-    TensorF32 W_up;      ///< SwiGLU up 支路：[I,H]，无偏置。
-    TensorF32 W_down;    ///< FFN 输出投影：[H,I]，无偏置。
+    LinearWeight Wo;     ///< Attention 输出投影：[H,H]。
+    TensorF32 ffn_norm;  ///< FFN RMSNorm：[H]。
+    LinearWeight W_gate; ///< SwiGLU gate：[I,H]。
+    LinearWeight W_up;   ///< SwiGLU up：[I,H]。
+    LinearWeight W_down; ///< FFN 输出投影：[H,I]。
 };
 
 // 全模型权重，推理期间只读使用。
@@ -82,15 +88,18 @@ struct Model
     ModelWeights weights;
 };
 
-// 加载指定 Transformer 层的权重。
+// 加载指定层，按指定格式保存七个投影矩阵。
 LayerWeights load_layer_weights(
     const std::filesystem::path& model_path,
     const SafeTensorsHeader& header,
     const ModelConfig& config,
-    int layer_index);
+    int layer_index,
+    WeightFormat weight_format);
 
-// 从模型目录加载配置和全部权重。
-Model load_model(const std::filesystem::path& model_dir);
+// 加载模型，默认保留 FP32 投影权重。
+Model load_model(
+    const std::filesystem::path& model_dir,
+    WeightFormat weight_format = WeightFormat::FP32);
 
 // 使用旋转后的 Q 和已写入的当前层缓存，计算 attn_out。
 void gqa_attention(
