@@ -2,7 +2,9 @@
 #include <cmath>
 #include <stdexcept>
 #include <cassert>
-
+#include <cstddef>
+#include <algorithm>
+#include <limits>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -95,6 +97,87 @@ void linear(
         // 每个线程独立计算自己负责的输出行。
         float sum = dot_product_f32(
             row_data, input.data(), in_features);
+
+        if (bias != nullptr)
+        {
+            sum += bias->data[row];
+        }
+
+        output[row] = sum;
+    }
+}
+
+/**
+ * @brief 使用 Q4 权重完成单 token 线性投影。
+ * @pre weight 为有效的行优先二维矩阵，输入列数为 32 的倍数；
+ *      可选 bias ，输入与输出使用独立缓冲区。
+ *
+ * 每行沿输入方向划分为若干块，每块独立使用 scale：
+ * y[row] = sum_b(scale[b] * sum_j(q[b,j] * input[b*32+j]))
+ *          + bias[row]
+ *
+ * 每个字节保存两个量化编码：
+ * 低四位对应块内位置 j，高四位对应位置 j+16。
+ * 编码减去固定偏移 8，得到有符号量化值。
+ *
+ * 输出行之间通过 OpenMP 并行；每个线程只写自己的输出元素。
+ */
+void linear_q4(
+    const TensorQ4& weight,
+    const std::vector<float>& input,
+    std::vector<float>& output,
+    const TensorF32* bias)
+{
+    const int out_features =
+        static_cast<int>(weight.shape[0]);
+    const int in_features =
+        static_cast<int>(weight.shape[1]);
+
+    assert(input.size() == static_cast<std::size_t>(in_features) &&
+           output.size() == static_cast<std::size_t>(out_features));
+
+    const std::size_t blocks_per_row =
+        static_cast<std::size_t>(in_features) / Q4_BLOCK_SIZE;
+
+    constexpr int half = Q4_BLOCK_SIZE / 2;
+
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < out_features; ++row)
+    {
+        // 定位当前输出行的第一个量化块。
+        const BlockQ4* row_blocks =
+            weight.blocks.data() +
+            static_cast<std::size_t>(row) * blocks_per_row;
+
+        float sum = 0.0f;
+
+        for (std::size_t b = 0; b < blocks_per_row; ++b)
+        {
+            const BlockQ4& block = row_blocks[b];
+
+            // 当前权重块对应输入中连续的 32 个元素。
+            const float* x =
+                input.data() + b * Q4_BLOCK_SIZE;
+
+            float block_sum = 0.0f;
+
+            for (int j = 0; j < half; ++j)
+            {
+                const std::uint8_t packed = block.packed[j];
+
+                const int q0 =
+                    static_cast<int>(packed & 0x0F) - 8;
+                const int q1 =
+                    static_cast<int>(packed >> 4) - 8;
+
+                // 两个半块分别与对应位置的输入相乘。
+                block_sum += static_cast<float>(q0) * x[j];
+                block_sum += static_cast<float>(q1) * x[j + half];
+            }
+
+            // 同一块共享 scale，累计后只乘一次。
+            sum += block.scale * block_sum;
+        }
 
         if (bias != nullptr)
         {
@@ -289,4 +372,249 @@ void swiglu_inplace(
         }
         gate[i] = x * sigmoid * up[i];
     }
+}
+
+/**
+ * @brief 将连续 32 个 FP32 权重量化为一个 Q4 块。
+ * @pre input 至少包含 Q4_BLOCK_SIZE 个有效元素。
+ *
+ * scale = max_i(abs(input[i])) / 7
+ * q[i] = clamp(round(input[i] / scale), -7, 7)
+ *
+ * 将 q[i] 加 8 转为四位无符号编码：
+ * packed[j] 的低四位保存第 j 项，高四位保存第 j+16 项。
+ */
+BlockQ4 quantize_q4_block(const float* input)
+{
+    constexpr int half = Q4_BLOCK_SIZE / 2;
+
+    float max_abs = 0.0f;
+
+    // 在量化入口检查非有限值，避免将 NaN / Inf 转成整数。
+    for (int i = 0; i < Q4_BLOCK_SIZE; ++i)
+    {
+        const float value = input[i];
+
+        if (!std::isfinite(value))
+        {
+            throw std::invalid_argument(
+                "Q4 quantization requires finite weights");
+        }
+
+        max_abs = std::max(max_abs, std::fabs(value));
+    }
+
+    BlockQ4 block;
+    block.scale = max_abs / 7.0f;
+
+    // q=0 对应编码 8，因此两个零组成字节 0x88。
+    block.packed.fill(0x88);
+
+    // 全零块直接返回，同时避免 scale 下溢为零时发生除零。
+    if (block.scale == 0.0f)
+    {
+        return block;
+    }
+
+    for (int j = 0; j < half; ++j)
+    {
+        // 前半块与后半块使用相同的缩放系数，分别量化。
+        const int q0 = std::clamp(
+            static_cast<int>(
+                std::round(input[j] / block.scale)),
+            -7, 7);
+
+        const int q1 = std::clamp(
+            static_cast<int>(
+                std::round(input[j + half] / block.scale)),
+            -7, 7);
+
+        const int low = q0 + 8;
+        const int high = q1 + 8;
+
+        // 前半块放低四位，后半块放高四位。
+        block.packed[j] =
+            static_cast<std::uint8_t>(low | (high << 4));
+    }
+
+    return block;
+}
+
+/**
+ * @brief 将一个 Q4 块近似还原为连续 32 个 FP32 权重。
+ * @pre block 为有效块，output 至少容纳 Q4_BLOCK_SIZE 项。
+ *
+ * 拆包得到四位编码，减去固定偏移 8，再乘块缩放系数：
+ * output[j]    = scale * (low - 8)
+ * output[j+16] = scale * (high - 8)
+ */
+void dequantize_q4_block(const BlockQ4& block, float* output)
+{
+    constexpr int half = Q4_BLOCK_SIZE / 2;
+
+    for (int j = 0; j < half; ++j)
+    {
+        const std::uint8_t packed = block.packed[j];
+
+        const int q0 = static_cast<int>(packed & 0x0F) - 8;
+        const int q1 = static_cast<int>(packed >> 4) - 8;
+
+        // 按量化时的前后半块配对，写回原始位置。
+        output[j] = block.scale * static_cast<float>(q0);
+        output[j + half] = block.scale * static_cast<float>(q1);
+    }
+}
+
+/**
+ * @brief 将二维 FP32 权重矩阵转换为行优先 Q4 矩阵。
+ * @pre 源数据数量与 shape 一致，由加载入口保证。
+ *
+ * 每行划分为 cols/32 个块，各块独立计算 scale。
+ * 第 row 行的第 b 块：
+ *   FP32 起点 = row * cols + b * Q4_BLOCK_SIZE
+ *   Q4 块索引 = row * blocks_per_row + b
+ */
+TensorQ4 quantize_q4_matrix(const TensorF32& weight)
+{
+    // 在转换入口检查当前 Q4 格式要求的形状。
+    if (weight.shape.size() != 2 ||
+        weight.shape[0] <= 0 ||
+        weight.shape[1] <= 0 ||
+        weight.shape[1] % Q4_BLOCK_SIZE != 0)
+    {
+        throw std::invalid_argument(
+            "Q4 requires a positive matrix with columns divisible by 32");
+    }
+
+    const std::size_t rows =
+        static_cast<std::size_t>(weight.shape[0]);
+    const std::size_t cols =
+        static_cast<std::size_t>(weight.shape[1]);
+    const std::size_t blocks_per_row = cols / Q4_BLOCK_SIZE;
+
+    assert(weight.data.size() == rows * cols);
+
+    TensorQ4 result;
+    result.shape = weight.shape;
+    result.blocks.resize(rows * blocks_per_row);
+
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        // 分别定位当前行的 FP32 数据和 Q4 块数组。
+        const float* source_row =
+            weight.data.data() + row * cols;
+        BlockQ4* target_row =
+            result.blocks.data() + row * blocks_per_row;
+
+        for (std::size_t b = 0; b < blocks_per_row; ++b)
+        {
+            target_row[b] = quantize_q4_block(
+                source_row + b * Q4_BLOCK_SIZE);
+        }
+    }
+
+    return result;
+}
+
+/**
+ * @brief 将 Q4 矩阵近似还原为相同形状的 FP32 矩阵。
+ * @pre weight 为量化或加载入口保证有效的二维 Q4 矩阵，
+ *      维度为正，列数为 Q4_BLOCK_SIZE 的倍数。
+ *
+ * 每个块还原到当前输出行中对应的连续 32 项。
+ * 该函数用于误差比较，后续 Q4 Linear 将直接读取量化块。
+ */
+TensorF32 dequantize_q4_matrix(const TensorQ4& weight)
+{
+    const std::size_t rows =
+        static_cast<std::size_t>(weight.shape[0]);
+    const std::size_t cols =
+        static_cast<std::size_t>(weight.shape[1]);
+    const std::size_t blocks_per_row = cols / Q4_BLOCK_SIZE;
+
+    assert(weight.blocks.size() == rows * blocks_per_row);
+
+    TensorF32 result;
+    result.shape = weight.shape;
+    result.data.resize(rows * cols);
+
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        const BlockQ4* source_row =
+            weight.blocks.data() + row * blocks_per_row;
+        float* target_row =
+            result.data.data() + row * cols;
+
+        for (std::size_t b = 0; b < blocks_per_row; ++b)
+        {
+            dequantize_q4_block(
+                source_row[b],
+                target_row + b * Q4_BLOCK_SIZE);
+        }
+    }
+
+    return result;
+}
+
+/**
+ * @brief 比较两组非空、等长的 FP32 数值。
+ *
+ * e[i] = actual[i] - reference[i]
+ * RMSE = sqrt(sum_i(e[i]^2) / N)
+ * relative_l2 = sqrt(sum_i(e[i]^2) / sum_i(reference[i]^2))
+ *
+ * 转为 double 后再相减和累加，减少统计本身的舍入误差。
+ * 参考数据全零时：误差也为零则返回 0，否则相对误差为正无穷。
+ */
+ErrorStats compute_error_stats(
+    const std::vector<float>& reference,
+    const std::vector<float>& actual)
+{
+    if (reference.empty() || reference.size() != actual.size())
+    {
+        throw std::invalid_argument(
+            "Error statistics require equally sized nonempty arrays");
+    }
+
+    ErrorStats stats;
+    double error_square_sum = 0.0;
+    double reference_square_sum = 0.0;
+
+    for (std::size_t i = 0; i < reference.size(); ++i)
+    {
+        const double ref = static_cast<double>(reference[i]);
+        const double value = static_cast<double>(actual[i]);
+        const double error = value - ref;
+
+        // 验证阶段拒绝非有限结果，避免 NaN 被最大值统计掩盖。
+        if (!std::isfinite(error))
+        {
+            throw std::runtime_error(
+                "Cannot measure error with non-finite values");
+        }
+
+        stats.max_abs_error =
+            std::max(stats.max_abs_error, std::fabs(error));
+
+        error_square_sum += error * error;
+        reference_square_sum += ref * ref;
+    }
+
+    const double count = static_cast<double>(reference.size());
+    stats.rmse = std::sqrt(error_square_sum / count);
+
+    if (reference_square_sum > 0.0)
+    {
+        stats.relative_l2_error =
+            std::sqrt(error_square_sum / reference_square_sum);
+    }
+    else
+    {
+        stats.relative_l2_error =
+            error_square_sum == 0.0
+                ? 0.0
+                : std::numeric_limits<double>::infinity();
+    }
+
+    return stats;
 }

@@ -43,4 +43,35 @@ void swiglu_inplace(
     std::vector<float>& gate,
     const std::vector<float>& up
 );
+
+// 将连续 32 个 FP32 权重量化为一个 Q4 块。
+BlockQ4 quantize_q4_block(const float* input);
+
+// 将一个 Q4 块还原到调用方提供的 32 项缓冲区。
+void dequantize_q4_block(const BlockQ4& block, float* output);
+
+// 量化二维权重矩阵，要求列数为 32 的倍数。
+TensorQ4 quantize_q4_matrix(const TensorF32& weight);
+
+// 将有效 Q4 矩阵近似还原为 FP32，用于误差检查。
+TensorF32 dequantize_q4_matrix(const TensorQ4& weight);
+
+// 两组等长数值的误差统计。
+struct ErrorStats
+{
+    double max_abs_error = 0.0;     ///< 最大绝对误差。
+    double rmse = 0.0;              ///< 均方根误差。
+    double relative_l2_error = 0.0; ///< 相对 L2 误差。
+};
+
+ErrorStats compute_error_stats(
+    const std::vector<float>& reference,
+    const std::vector<float>& actual);
+
+// Q4 权重、FP32 输入输出；输出由调用方预分配。
+void linear_q4(
+    const TensorQ4& weight,
+    const std::vector<float>& input,
+    std::vector<float>& output,
+    const TensorF32* bias = nullptr);
 #endif // OPERATORS_H

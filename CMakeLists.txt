@@ -34,3 +34,23 @@ if(MSVC)
         )
     endif()
 endif()
+
+add_executable(q4_check
+    tools/q4_check.cpp
+    src/safetensors_loader.cpp
+    src/operators.cpp
+)
+
+target_compile_features(q4_check PRIVATE cxx_std_17)
+set_target_properties(q4_check PROPERTIES CXX_EXTENSIONS OFF)
+
+target_include_directories(q4_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+)
+
+target_link_libraries(q4_check PRIVATE OpenMP::OpenMP_CXX)
+
+if(MSVC)
+    target_compile_options(q4_check PRIVATE /W4 /utf-8 /EHsc)
+endif()
