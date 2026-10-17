@@ -36,6 +36,14 @@ __pycache__/
 /.codex/
 /.agents/
 
+# Private development notes, publication backups and local tooling
+/.local-dev/
+*.bundle
+/docs/MiniEdgeLLM_*.md
+/docs/Review_*.md
+/docs/Edge_Inference_Research_*.md
+/docs/archive/
+
 # Generated text and token IDs; keep the small prompt fixtures
 /data/generated*.json
 /data/generated*.txt
