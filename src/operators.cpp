@@ -59,6 +59,33 @@ float dot_product_f32(const float* a, const float* b, int count)
     return sum;
 }
 
+/**
+ * @brief 计算一个 Q4 块与 FP32 输入的点积，不乘 scale。
+ * @pre block 有效，input 至少包含 Q4_BLOCK_SIZE 项。
+ *
+ * 低四位对应位置 j，高四位对应位置 j+16；
+ * 编码减 8 后参与点积，scale 由调用方统一应用。
+ */
+float dot_product_q4_block(
+    const BlockQ4& block,
+    const float* input)
+{
+    constexpr int half = Q4_BLOCK_SIZE / 2;
+    float sum = 0.0f;
+
+    for (int j = 0; j < half; ++j)
+    {
+        const std::uint8_t packed = block.packed[j];
+        const int q0 = static_cast<int>(packed & 0x0F) - 8;
+        const int q1 = static_cast<int>(packed >> 4) - 8;
+
+        sum += static_cast<float>(q0) * input[j];
+        sum += static_cast<float>(q1) * input[j + half];
+    }
+
+    return sum;
+}
+
 } // namespace
 
 /**
@@ -109,18 +136,13 @@ void linear(
 
 /**
  * @brief 使用 Q4 权重完成单 token 线性投影。
- * @pre weight 为有效的行优先二维矩阵，输入列数为 32 的倍数；
- *      可选 bias ，输入与输出使用独立缓冲区。
+ * @pre 权重有效，输入输出使用独立且尺寸匹配的缓冲区。
  *
- * 每行沿输入方向划分为若干块，每块独立使用 scale：
- * y[row] = sum_b(scale[b] * sum_j(q[b,j] * input[b*32+j]))
- *          + bias[row]
+ * 每个块先计算未缩放的整数权重点积，再乘对应 scale：
+ * y[row] = sum_b(scale[b] * dot(q[b], input[b])) + bias[row]
  *
- * 每个字节保存两个量化编码：
- * 低四位对应块内位置 j，高四位对应位置 j+16。
- * 编码减去固定偏移 8，得到有符号量化值。
- *
- * 输出行之间通过 OpenMP 并行；每个线程只写自己的输出元素。
+ * 块内计算由 helper 选择 SIMD 或普通循环；
+ * 输出行之间继续使用 OpenMP 并行。
  */
 void linear_q4(
     const TensorQ4& weight,
@@ -139,12 +161,9 @@ void linear_q4(
     const std::size_t blocks_per_row =
         static_cast<std::size_t>(in_features) / Q4_BLOCK_SIZE;
 
-    constexpr int half = Q4_BLOCK_SIZE / 2;
-
     #pragma omp parallel for schedule(static)
     for (int row = 0; row < out_features; ++row)
     {
-        // 定位当前输出行的第一个量化块。
         const BlockQ4* row_blocks =
             weight.blocks.data() +
             static_cast<std::size_t>(row) * blocks_per_row;
@@ -153,30 +172,13 @@ void linear_q4(
 
         for (std::size_t b = 0; b < blocks_per_row; ++b)
         {
-            const BlockQ4& block = row_blocks[b];
-
-            // 当前权重块对应输入中连续的 32 个元素。
             const float* x =
                 input.data() + b * Q4_BLOCK_SIZE;
 
-            float block_sum = 0.0f;
+            const float block_sum =
+                dot_product_q4_block(row_blocks[b], x);
 
-            for (int j = 0; j < half; ++j)
-            {
-                const std::uint8_t packed = block.packed[j];
-
-                const int q0 =
-                    static_cast<int>(packed & 0x0F) - 8;
-                const int q1 =
-                    static_cast<int>(packed >> 4) - 8;
-
-                // 两个半块分别与对应位置的输入相乘。
-                block_sum += static_cast<float>(q0) * x[j];
-                block_sum += static_cast<float>(q1) * x[j + half];
-            }
-
-            // 同一块共享 scale，累计后只乘一次。
-            sum += block.scale * block_sum;
+            sum += row_blocks[b].scale * block_sum;
         }
 
         if (bias != nullptr)

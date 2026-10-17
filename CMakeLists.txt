@@ -54,3 +54,26 @@ target_link_libraries(q4_check PRIVATE OpenMP::OpenMP_CXX)
 if(MSVC)
     target_compile_options(q4_check PRIVATE /W4 /utf-8 /EHsc)
 endif()
+
+add_executable(qwen_chat
+    src/chat_main.cpp
+    src/model_config.cpp
+    src/config_loader.cpp
+    src/safetensors_loader.cpp
+    src/operators.cpp
+    src/model.cpp
+)
+
+target_compile_features(qwen_chat PRIVATE cxx_std_17)
+set_target_properties(qwen_chat PROPERTIES CXX_EXTENSIONS OFF)
+
+target_include_directories(qwen_chat PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+)
+
+target_link_libraries(qwen_chat PRIVATE OpenMP::OpenMP_CXX)
+
+if(MSVC)
+    target_compile_options(qwen_chat PRIVATE /W4 /utf-8 /EHsc)
+endif()

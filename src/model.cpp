@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <chrono>
 #include <utility>
+#include <cstdint>
+
 
 /**
  * @brief 按模型要求校验形状，并加载为拥有内存的 FP32 张量。

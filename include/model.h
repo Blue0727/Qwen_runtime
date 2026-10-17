@@ -101,6 +101,7 @@ Model load_model(
     const std::filesystem::path& model_dir,
     WeightFormat weight_format = WeightFormat::FP32);
 
+
 // 使用旋转后的 Q 和已写入的当前层缓存，计算 attn_out。
 void gqa_attention(
     const ModelConfig& config,
